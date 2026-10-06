@@ -1,0 +1,21 @@
+{
+  "name": "medclass",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --env-file-if-exists=.env --watch server.js",
+    "test": "node --test test/*.test.js",
+    "test:browser": "playwright test",
+    "seed": "node --env-file-if-exists=.env scripts/seed.js",
+    "create-admin": "node --env-file-if-exists=.env scripts/create-admin.js",
+    "remove-demo": "node --env-file-if-exists=.env scripts/remove-demo.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
+  }
+}
