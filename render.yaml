@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: medclass
+    runtime: docker
+    repo: https://github.com/abdelmac/Tituclass
+    region: frankfurt
+    plan: 1c-2g
+    numInstances: 1
+    healthCheckPath: /healthz
+    disk:
+      name: medclass-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: APP_ORIGIN
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /app/data/medclass.sqlite
+      - key: HOST
+        value: 0.0.0.0

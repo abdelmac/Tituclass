@@ -68,6 +68,50 @@ Browser tests use installed Chrome (override `BROWSER_EXECUTABLE` if needed), a 
 
 ## Deploy
 
+Production deployment is prepared in [deploy/compose.yaml](deploy/compose.yaml) (VPS with Caddy HTTPS and backups) and [render.yaml](render.yaml) (Render with a persistent disk). No remote host/account has been selected or connected yet; these files do not mean the app is already publicly deployed.
+
+### Capacity for the first class
+
+The load test passed with **200 simultaneously connected students**, **50 published changes in a burst**, 251 events, and **18,250 historical notifications** (one year at 50/day). All 10,000 live update deliveries arrived and every student read the final saved version. On the local development machine, the publication burst took 0.88 seconds, publish p95 was 25 ms, simultaneous class-read p95 was 2.59 seconds, and the process used about 174 MiB RSS. These are local measurements, not a production-host guarantee.
+
+Start with one application instance on a 1 CPU / 1–2 GB RAM server and persistent local storage. Measure again on the actual host before inviting everyone. SQLite WAL is appropriate for this starting workload; adding users does not require adding a database connection per user. Horizontal scaling requires a future shared database and cross-instance live-update transport. Monitor response latency, memory, disk space, backup age, and errors as the class grows.
+
+`npm.cmd run test:load` reproduces the isolated test. You can increase `LOAD_USERS` and `LOAD_CHANGES` (up to 1000 and 500). The test generates temporary accounts/database files and never touches the real database.
+
+Deployment preparation also adds:
+
+- Account-specific login limits, so students behind a campus NAT or reverse proxy do not share a 20-attempt quota.
+- A bounded notification feed with **Load older updates**, exact unread totals, and subgroup-safe cursors.
+- Database indexes, coalesced browser refreshes, and up to five live connections per account.
+- `/healthz`, container health checks, graceful shutdown, production HTTPS/cookie checks, and rejection of known demo accounts in production.
+- Verified SQLite online backups. Demo sign-in shortcuts are hidden when demonstration data is unavailable.
+
+### VPS with Docker Compose
+
+Point the domain to your server, install Docker with Compose, and allow inbound ports 80/443. From the checked-out repository on the server:
+
+```sh
+cp deploy/.env.example deploy/.env
+# Edit MEDCLASS_DOMAIN in deploy/.env to your actual hostname.
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
+```
+
+Only Caddy exposes public ports; the Node server is internal. Caddy obtains and renews the domain's HTTPS certificates. The database, backups, and certificates use persistent named volumes. The app runs as an unprivileged user with a 1 GB memory limit and restart policy.
+
+Bootstrap a real admin in the running `app` container using `scripts/create-admin.js` and `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_NAME`, `CLASS_NAME`, and `CLASS_TIMEZONE`. Pass secret values through your deployment secret mechanism; do not paste them into chat or commit them. Do not seed the production database.
+
+The `backups` container takes a verified database snapshot every six hours and retains 30 days locally. **Copy backups off the server** to your storage service too: a second volume on the same server does not protect against server loss. Check failures with `docker compose --env-file deploy/.env -f deploy/compose.yaml logs backups`. A standalone backup is `npm run backup`; it uses `BACKUP_PATH` and `BACKUP_RETENTION_DAYS`.
+
+For a restoration, stop `app` and `backups`, preserve the current database directory, then restore a verified snapshot into the database volume with owner UID/GID 1000. Remove obsolete WAL/SHM files only after preserving the stopped original directory. Restart and verify login, saved schedules, and `/healthz`. Never restore over a live database. To update the app, rerun `up -d --build`; use `down` without `-v` if stopping services. `down -v` would delete data volumes.
+
+### Render
+
+Connect your Render account and deploy the repository's Blueprint. It declares one paid `1c-2g` Docker web service in Frankfurt with a 1 GB persistent disk, HTTPS-only cookies, and `/healthz`. Set `APP_ORIGIN` to the exact public HTTPS service URL or custom domain, then deploy. Review current pricing in Render before creating the service. Bootstrap the admin from the service's Shell using the command above.
+
+An attached disk is available only at runtime and supports one service instance; disk-backed deployments have brief downtime. Do not run the admin bootstrap in a build/pre-deploy command that cannot access the disk. For Render backups, schedule `node scripts/backup.js` on the running service and copy verified snapshots off-host; the VPS backup sidecar is not automatically installed by the Render Blueprint. See [persistent-disk requirements](https://render.com/docs/disks), [Blueprint fields](https://render.com/docs/blueprint-spec), and [compute plans](https://render.com/docs/compute-plans).
+
+### Manual container setup
+
 Use a persistent VM/container with Node.js 24.15+. No database service credentials are required. Do not use an ephemeral or static-only host: SQLite needs a durable writable volume and SSE needs a running server.
 
 1. Deploy the source and run `npm ci --omit=dev` (there are no runtime packages).
@@ -95,4 +139,4 @@ Create the admin in that container with `docker exec`, providing the bootstrap v
 - Calendar dates/times are class-local wall-clock values, with a configurable IANA timezone; expiration inputs explicitly use the device timezone. Changing the class timezone reinterprets existing wall-clock times rather than moving events.
 - No offline editing, password reset email, email verification, or MFA. An operator can bootstrap an additional admin account if needed. Users should retain their passwords; add an email service/recovery workflow before broad production rollout.
 - A single app instance with a SQLite volume is the supported deployment. Multiple instances need a shared database plus cross-instance live-update transport. Rate-limit counters are per process. SSE currently broadcasts refresh signals, not notification payloads.
-- Browser and API tests exercise workflows, but do not substitute for a production security review or assistive-technology testing. No public deployment was made from this workspace.
+- Browser and API tests exercise workflows, but do not substitute for a production security review or assistive-technology testing. Deployment requires access to the chosen hosting account/server; no public deployment has been verified yet.

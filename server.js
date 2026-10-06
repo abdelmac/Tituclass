@@ -8,7 +8,9 @@ import { validateEvent, serializeEvent, changes } from './lib/events.js';
 
 const publicPath = fileURLToPath(new URL('./public/', import.meta.url));
 export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secure = process.env.COOKIE_SECURE === 'true' } = {}) {
+  if (process.env.NODE_ENV === 'production' && (!origin || !/^https:\/\//.test(origin) || !secure)) throw Error('Production requires an HTTPS APP_ORIGIN and COOKIE_SECURE=true.');
   const db = openDatabase(databasePath);
+  if (process.env.NODE_ENV === 'production' && db.prepare("SELECT 1 FROM users WHERE email LIKE '%@medclass.demo'").get()) { db.close(); throw Error('Remove demo accounts before starting production.'); }
   const streams = new Set();
   const attempts = new Map();
   const member = (classId, userId, roles) => {
@@ -34,12 +36,29 @@ export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secur
     res.setHeader('Set-Cookie',cookie(value)); return csrf;
   };
   const json = (res, status, value) => { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(value)); };
-  const limited = key => {
+  const limited = (key, max = 20) => {
     const record = attempts.get(key) || { count:0, until:Date.now() + 15*60000 };
     if (record.until < Date.now()) { record.count = 0; record.until = Date.now() + 15*60000; }
     record.count++; attempts.set(key,record);
-    if (record.count > 20) fail(429, 'Too many attempts. Please try again in 15 minutes.');
+    if (record.count > max) fail(429, 'Too many attempts. Please try again in 15 minutes.');
     if (attempts.size > 10000) for (const [k,v] of attempts) if (v.until < Date.now()) attempts.delete(k);
+  };
+  const authLimit = (req, email) => {
+    limited('account:'+hash(email));
+    limited('peer:'+req.socket.remoteAddress, 2000);
+  };
+  const notificationPage = (classId, m, userId, before) => {
+    let cursor = null;
+    if (before) {
+      cursor = db.prepare('SELECT id,created_at,subgroup FROM notifications WHERE id=? AND class_id=?').get(before,classId);
+      if (!cursor || !visible(cursor.subgroup,m)) fail(404,'Update cursor not found.');
+    }
+    const scope = m.role === 'student' ? " AND (n.subgroup='' OR n.subgroup=?)" : '';
+    const scopeArgs = m.role === 'student' ? [m.subgroup] : [];
+    const rows = db.prepare(`SELECT n.*,u.name AS author,EXISTS(SELECT 1 FROM notification_reads r WHERE r.notification_id=n.id AND r.user_id=?) AS is_read FROM notifications n JOIN users u ON u.id=n.author_id WHERE n.class_id=?${scope}${cursor?' AND (n.created_at<? OR (n.created_at=? AND n.id<?))':''} ORDER BY n.created_at DESC,n.id DESC LIMIT 101`).all(userId,classId,...scopeArgs,...(cursor?[cursor.created_at,cursor.created_at,cursor.id]:[]));
+    const unreadCount = db.prepare(`SELECT COUNT(*) AS count FROM notifications n WHERE n.class_id=?${scope} AND NOT EXISTS(SELECT 1 FROM notification_reads r WHERE r.notification_id=n.id AND r.user_id=?)`).get(classId,...scopeArgs,userId).count;
+    const changedSinceVisit = m.last_visit ? db.prepare(`SELECT COUNT(*) AS count FROM notifications n WHERE n.class_id=?${scope} AND n.created_at>?`).get(classId,...scopeArgs,m.last_visit).count : 0;
+    return {notifications:rows.slice(0,100),notificationMore:rows.length>100,unreadCount,changedSinceVisit};
   };
   const server = http.createServer(async (req,res) => {
     res.setHeader('X-Content-Type-Options','nosniff');
@@ -48,6 +67,9 @@ export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secur
     res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     try {
       const url = new URL(req.url,'http://localhost'), path = url.pathname;
+      if (path === '/healthz' && req.method === 'GET') {
+        db.prepare('SELECT 1').get(); return json(res,200,{ok:true});
+      }
       if (!path.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') fail(405,'Method not allowed.');
         const files = {'/':'index.html','/app.js':'app.js','/styles.css':'styles.css','/icon.svg':'icon.svg'};
@@ -57,6 +79,7 @@ export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secur
         res.setHeader('Cache-Control','no-cache'); res.end(req.method === 'HEAD' ? undefined : buffer); return;
       }
       res.setHeader('Cache-Control','no-store');
+      if (path === '/api/config' && req.method === 'GET') return json(res,200,{demoAvailable:process.env.NODE_ENV !== 'production' && Boolean(db.prepare('SELECT 1 FROM classes WHERE demo=1').get())});
       const mutating = !['GET','HEAD'].includes(req.method);
       if (mutating) {
         const expected = origin || `http://${req.headers.host}`;
@@ -73,17 +96,18 @@ export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secur
       const sessionValue = req.headers.cookie?.split(';').map(x=>x.trim()).find(x=>x.startsWith('medclass_session='))?.slice(17);
       const session = sessionValue && db.prepare('SELECT s.*,u.name,u.email FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?').get(hash(sessionValue),Date.now());
       if (path === '/api/auth/login' && req.method === 'POST') {
-        limited(req.socket.remoteAddress);
         const { email, password } = credentials(body);
+        authLimit(req,email);
         const user = db.prepare('SELECT * FROM users WHERE email=?').get(email);
         // Derive a dummy hash as well, so unknown accounts take comparable time.
         const ok = user ? await passwordMatches(password,user.password) : (await passwordHash(password),false);
         if (!ok) fail(401,'Email or password is incorrect.');
+        attempts.delete('account:'+hash(email));
         return json(res,200,{csrf:login(res,user.id)});
       }
       if (path === '/api/auth/register' && req.method === 'POST') {
-        limited(req.socket.remoteAddress);
         const {email,password} = credentials(body), name = text(body.name,'name',100,true);
+        authLimit(req,email);
         const code = text(body.code,'invitation code',150,true);
         const passwordValue = await passwordHash(password);
         const userId = id();
@@ -94,6 +118,7 @@ export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secur
           db.prepare('INSERT INTO users VALUES (?,?,?,?,?)').run(userId,name,email,passwordValue,now());
           db.prepare('INSERT INTO members(class_id,user_id,role,subgroup) VALUES (?,?,?,?)').run(invitation.class_id,userId,'student',invitation.subgroup);
         });
+        attempts.delete('account:'+hash(email));
         return json(res,201,{csrf:login(res,userId)});
       }
       if (!session) fail(401,'Please sign in to continue.');
@@ -129,17 +154,18 @@ export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secur
       const editor = () => member(classId,session.user_id,['admin','editor']);
       const admin = () => member(classId,session.user_id,['admin']);
       if (route === 'stream' && req.method === 'GET') {
+        if ([...streams].filter(s=>s.userId===session.user_id).length>=5) fail(429,'Too many open live sessions. Close another tab and try again.');
         res.writeHead(200,{'Content-Type':'text/event-stream','Connection':'keep-alive','X-Accel-Buffering':'no'});
         res.write('event: ready\ndata: {}\n\n');
         const stream = {res,userId:session.user_id,classId,token:session.token}; streams.add(stream);
-        req.on('close',()=>streams.delete(stream)); return;
+        res.on('close',()=>streams.delete(stream)); return;
       }
       if (route === '' && req.method === 'GET') {
         const events=db.prepare('SELECT * FROM events WHERE class_id=?').all(classId).map(serializeEvent).filter(e=>visible(e.subgroup,m));
         const announcements=db.prepare('SELECT a.*,u.name AS author FROM announcements a JOIN users u ON u.id=a.author_id WHERE class_id=? AND (expires_at IS NULL OR expires_at>?) ORDER BY pinned DESC,updated_at DESC').all(classId,now()).filter(a=>visible(a.subgroup,m));
-        const notifications=db.prepare('SELECT n.*,u.name AS author,EXISTS(SELECT 1 FROM notification_reads r WHERE r.notification_id=n.id AND r.user_id=?) AS is_read FROM notifications n JOIN users u ON u.id=n.author_id WHERE n.class_id=? ORDER BY n.created_at DESC').all(session.user_id,classId).filter(n=>visible(n.subgroup,m));
-        return json(res,200,{class:db.prepare('SELECT * FROM classes WHERE id=?').get(classId),role:m.role,subgroup:m.subgroup,lastVisit:m.last_visit,events,announcements,notifications,serverTime:now()});
+        return json(res,200,{class:db.prepare('SELECT * FROM classes WHERE id=?').get(classId),role:m.role,subgroup:m.subgroup,lastVisit:m.last_visit,events,announcements,...notificationPage(classId,m,session.user_id),serverTime:now()});
       }
+      if (route === 'notifications' && req.method === 'GET') return json(res,200,notificationPage(classId,m,session.user_id,url.searchParams.get('before')));
       if (route === 'visit' && req.method === 'POST') {
         db.prepare('UPDATE members SET last_visit=? WHERE class_id=? AND user_id=?').run(now(),classId,session.user_id); return json(res,200,{ok:true});
       }
@@ -288,9 +314,14 @@ export function createApp({ databasePath, origin = process.env.APP_ORIGIN, secur
     }
   },25000); heartbeat.unref();
   server.on('close',()=>{ clearInterval(heartbeat); db.close(); });
-  return {server,db,close:async()=>{for(const s of streams)s.res.end(); await new Promise(r=>server.close(r));}};
+  let closing;
+  return {server,db,close:()=>closing ||= (async()=>{for(const s of streams)s.res.end(); await new Promise(r=>server.close(r));})()};
 }
 if (process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
-  const {server}=createApp();
+  const app=createApp(), {server}=app;
+  for (const signal of ['SIGTERM','SIGINT']) process.on(signal,async()=>{
+    const deadline=setTimeout(()=>process.exit(1),15000);deadline.unref();
+    await app.close();clearTimeout(deadline);process.exit(0);
+  });
   server.listen(Number(process.env.PORT||3000),process.env.HOST||'127.0.0.1',()=>console.log(`MedClass is running at http://${process.env.HOST||'localhost'}:${process.env.PORT||3000}`));
 }
